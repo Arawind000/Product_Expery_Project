@@ -1,4 +1,5 @@
-Smart IoT-Based Expiry Date Management System
+**Smart IoT-Based Expiry Date Management System**
+
 📌 Overview
 
 The Smart IoT-Based Expiry Date Management System is designed to monitor product expiry dates and generate alerts before products expire. This system helps reduce waste, improve inventory management, and prevent the use of expired items.
