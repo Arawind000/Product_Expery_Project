@@ -1,0 +1,254 @@
+//arawindj@gmail.com
+//arawind 09.
+//User Name: product_expiry
+//PW       : Projectiot@123
+
+
+#include <WiFi.h>
+#include <time.h>
+#include <LiquidCrystal.h>
+#include <map>
+#include <ArduinoIoTCloud.h>
+#include <Arduino_ConnectionHandler.h>
+
+// ========== IoT Cloud Credentials ==========
+const char DEVICE_LOGIN_NAME[]  = "2fff16d0-57a5-42a1-8e81-69b9e50fee93";
+const char DEVICE_KEY[]         = "ebaP9bH9U2Z?wy@G6nchvh3PL";    
+const char SSID[]               = "projectiot";    
+const char PASS[]               = "123456789xyz";    
+
+// ========== IoT Cloud Properties ==========
+String product;   // Holds Name + Expiry + Status
+bool valid;       // true = still valid, false = expired
+
+void onProductChange() {}
+void onValidChange() {}
+
+void initProperties() {
+  ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
+  ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
+
+  ArduinoCloud.addProperty(product, READWRITE, ON_CHANGE, onProductChange);
+  ArduinoCloud.addProperty(valid,   READWRITE, ON_CHANGE, onValidChange);
+}
+
+WiFiConnectionHandler ArduinoIoTPreferredConnection(SSID, PASS);
+
+// ========== LCD Pins (RS, E, D4, D5, D6, D7) ==========
+LiquidCrystal lcd(2, 15, 19, 18, 5, 4);
+
+// ========== RFID via Serial2 ==========
+#define RXD2 16
+#define TXD2 17
+HardwareSerial RFIDSerial(2);
+
+// ========== Time (NTP) Settings ==========
+const long gmtOffset_sec = 19800;  // GMT+5:30 (IST)
+const int daylightOffset_sec = 0;
+struct tm timeinfo;
+
+// ========== Product Database ==========
+struct ProductInfo {
+  String name;
+  String expiry;  // Format: "YYYY-MM-DD"
+};
+
+std::map<String, ProductInfo> productDB = {
+  {"510054C6A665", {"Biscuit", "2025-09-20"}},
+  {"5100522488AF", {"Oil",     "2025-09-30"}},
+  {"51005403ADAB", {"Paste",   "2025-10-15"}},
+};
+
+// ========== Time Conversion ==========
+time_t convertToTimeT(String dateStr) {
+  struct tm tmStruct;
+  sscanf(dateStr.c_str(), "%d-%d-%d", &tmStruct.tm_year, &tmStruct.tm_mon, &tmStruct.tm_mday);
+  tmStruct.tm_year -= 1900;
+  tmStruct.tm_mon -= 1;
+  tmStruct.tm_hour = 0;
+  tmStruct.tm_min = 0;
+  tmStruct.tm_sec = 0;
+  tmStruct.tm_isdst = -1;
+  return mktime(&tmStruct);
+}
+
+// ========== Display Management ==========
+unsigned long lastUpdate = 0;
+const unsigned long clockUpdateInterval = 1000;
+
+bool showingProductInfo = false;
+unsigned long productDisplayStart = 0;
+const unsigned long firstScreenDuration = 3000;  // ms
+const unsigned long secondScreenDuration = 3000; // ms
+int displayPhase = 0;  // 0 = none, 1 = product+expiry, 2 = status
+
+// Temporary storage
+String currentName = "";
+String currentExpiry = "";
+int currentDaysDiff = 0;
+
+// ========== Setup ==========
+void setup() {
+  Serial.begin(115200);
+  RFIDSerial.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  lcd.begin(16, 2);
+  lcd.print("Connecting WiFi");
+
+  WiFi.begin(SSID, PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  lcd.clear();
+  lcd.print("WiFi Connected");
+
+  // Start IoT Cloud
+  initProperties();
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  while (!getLocalTime(&timeinfo)) {
+    lcd.setCursor(0, 1);
+    lcd.print("Getting time...");
+    delay(500);
+  }
+
+  lcd.clear();
+}
+
+// ========== Clock Display ==========
+void displayIdleClock() {
+  if (getLocalTime(&timeinfo)) {
+    char buffer[20];
+    strftime(buffer, sizeof(buffer), "%d-%m-%Y", &timeinfo);
+    lcd.setCursor(0, 0);
+    lcd.print(buffer);
+    lcd.setCursor(0, 1);
+    lcd.print("Scan Product...  ");
+  }
+}
+
+// ========== Handle Product Display ==========
+void handleProductDisplay() {
+  unsigned long now = millis();
+
+  if (displayPhase == 1 && now - productDisplayStart >= firstScreenDuration) {
+    // --- Second screen: Status ---
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Status");
+
+    String statusMsg = "";
+    if (currentDaysDiff < 0) {
+      statusMsg = "Expired " + String(-currentDaysDiff) + "d ago";
+    } else if (currentDaysDiff == 0) {
+      statusMsg = "Expires Today";
+    } else {
+      statusMsg = String(currentDaysDiff) + " Days Left";
+    }
+
+    lcd.setCursor(0, 1);
+    lcd.print(statusMsg);
+
+    // === Build info for IoT Cloud ===
+    valid = (currentDaysDiff >= 0);
+    product = "Product: " + currentName + 
+              " | Exp: " + currentExpiry + 
+              " | Status: " + statusMsg;
+
+    displayPhase = 2;
+    productDisplayStart = now;
+  }
+  else if (displayPhase == 2 && now - productDisplayStart >= secondScreenDuration) {
+    // Back to clock
+    lcd.clear();
+    showingProductInfo = false;
+    displayPhase = 0;
+  }
+}
+
+// ========== Main Loop ==========
+void loop() {
+  ArduinoCloud.update();   // Sync with IoT Cloud
+
+  if (RFIDSerial.available()) {
+    showingProductInfo = true;
+    productDisplayStart = millis();
+    displayPhase = 1;
+
+    String tagID = "";
+    while (RFIDSerial.available()) {
+      char ch = RFIDSerial.read();
+      tagID += ch;
+      delay(5);  // Ensure full read
+    }
+
+    tagID.trim();
+    Serial.println("Scanned Tag: " + tagID);
+
+    if (productDB.find(tagID) != productDB.end()) {
+      ProductInfo productInfo = productDB[tagID];
+      currentName = productInfo.name;
+      currentExpiry = productInfo.expiry;
+
+      if (getLocalTime(&timeinfo)) {
+        struct tm currentDateOnly = timeinfo;
+        currentDateOnly.tm_hour = 0;
+        currentDateOnly.tm_min = 0;
+        currentDateOnly.tm_sec = 0;
+        time_t today = mktime(&currentDateOnly);
+
+        time_t expiry = convertToTimeT(currentExpiry);
+        currentDaysDiff = (expiry - today) / 86400;
+      } else {
+        currentDaysDiff = 0;
+      }
+
+      // --- First screen: Product + Expiry ---
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Product: ");
+      lcd.print(currentName);
+
+      // Format expiry into DD-MM-YY
+      String dd = currentExpiry.substring(8, 10);
+      String mm = currentExpiry.substring(5, 7);
+      String yy = currentExpiry.substring(2, 4);
+
+      lcd.setCursor(0, 1);
+      lcd.print("Ex Date:");
+      lcd.print(dd);
+      lcd.print("-");
+      lcd.print(mm);
+      lcd.print("-");
+      lcd.print(yy);
+
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Unknown Product");
+      lcd.setCursor(0, 1);
+      lcd.print(tagID.substring(0, 12));
+
+      // === Send unknown product to IoT Cloud ===
+      product = "Product: Unknown | Exp: - | Status: Not Found";
+      valid = false;
+
+      displayPhase = 2;
+    }
+
+    return;
+  }
+
+  if (showingProductInfo) {
+    handleProductDisplay();
+  } else {
+    if (millis() - lastUpdate >= clockUpdateInterval) {
+      lastUpdate = millis();
+      displayIdleClock();
+    }
+  }
+
+  delay(50);
+}
